@@ -10,6 +10,7 @@
 #include <commctrl.h>
 #include <shellapi.h>
 #include "installer.h"
+#include "../common/steam_launch_context.h"
 #include "../common/manual_vr_recovery.h"
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(linker, "/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='amd64' publicKeyToken='6595b64144ccf1df' language='*'\"")
@@ -139,6 +140,27 @@ static DWORD FindProcessId(const wchar_t* exeName)
 static bool ProcessRunning(const wchar_t* exeName)
 {
     return FindProcessId(exeName) != 0;
+}
+
+// Wine/Proton's Steam client helper is not always visible to a process snapshot
+// in the game's compatibility session. These inherited markers identify a
+// Proton-launched Steam context, but are not an ownership/authentication check.
+static bool RunningUnderWine()
+{
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    return ntdll != nullptr && GetProcAddress(ntdll, "wine_get_version") != nullptr;
+}
+
+static void ReadProtonSteamMarkers(bool& steamPathPresent,
+                                   bool& valvePlatformMutexPresent)
+{
+    // Proton's steam_helper sets both for its SteamGameId game-process path.
+    // Deliberately do not accept SteamAppId alone: callers can set it freely.
+    wchar_t value[2]{};
+    steamPathPresent = GetEnvironmentVariableW(
+        L"SteamPath", value, ARRAYSIZE(value)) > 0;
+    valvePlatformMutexPresent = GetEnvironmentVariableW(
+        L"ValvePlatformMutex", value, ARRAYSIZE(value)) > 0;
 }
 
 static int OfferManualVrRecovery(DWORD pid, const std::wstring& expectedExe)
@@ -424,11 +446,27 @@ static int LaunchInstalledMod(const std::wstring& dir)
     // Steam only owns the Steam edition's licensing. The Store edition is
     // licensed by the Xbox app, so demanding Steam there would reject a
     // perfectly valid install.
-    if (edition == Edition::Steam && !ProcessRunning(L"steam.exe"))
+    if (edition == Edition::Steam)
     {
-        ErrorBox(L"Steam is not running.\n\nStart Steam first, then run this launcher again.\n"
-                 L"(This Steam copy of the game needs Steam to verify ownership.)");
-        return 1;
+        const bool steamProcessVisible = ProcessRunning(L"steam.exe");
+        const bool underWine = !steamProcessVisible && RunningUnderWine();
+        bool steamPathPresent = false;
+        bool valvePlatformMutexPresent = false;
+        if (underWine)
+            ReadProtonSteamMarkers(steamPathPresent, valvePlatformMutexPresent);
+        if (!mccvr::SteamLaunchAllowed(false, steamProcessVisible,
+                                       underWine, steamPathPresent,
+                                       valvePlatformMutexPresent))
+        {
+            ErrorBox(L"Steam is not running.\n\nStart Steam first, then run this launcher again.\n"
+                     L"(This Steam copy of the game needs Steam to verify ownership.)");
+            return 1;
+        }
+        if (steamProcessVisible)
+            LauncherLog("Steam launch context: visible steam.exe process");
+        else
+            LauncherLog("Steam launch context: Proton markers detected under Wine; "
+                        "context only, not ownership verification");
     }
     // The running mod handles recovery on its title worker. Never inject a
     // second copy or start a competing MCC process for this action.
